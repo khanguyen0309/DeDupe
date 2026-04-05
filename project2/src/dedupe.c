@@ -2,249 +2,256 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdint.h>
+#include <stdatomic.h>
 
 #include "hash_functions.h"
 #include <pthread.h>
-#include <stdbool.h>
 
-#define INITIAL_CAPACITY 1024
 #define MAX_PARALLEL_WORKERS 8
 #define STDIO_OUTPUT_BUFSZ ((size_t)1 << 20)
+#define NUM_STRIPES 1024
+#define HT_SLOT_FACTOR 2
+#define HT_MIN_SLOTS_LEN 16
 
-// Chunk structure
 typedef struct {
-    int index;
-    unsigned char *hash;
+	int index;
+	unsigned char *hash;
 } ChunkHash;
 
-
-// Shared Memory structure
 typedef struct {
 	ChunkHash *data;
-	int count;
-	int capacity;
-	pthread_mutex_t lock;
-} SharedMem;
+	int *slots;
+	int slots_len;
+	int n_chunks;
+	_Atomic int next_data;
+	pthread_mutex_t stripes[NUM_STRIPES];
+} GlobalTable;
 
-// Thread argument structure
 typedef struct {
-    ChunkHash *input_array;
-    int start;
-    int end;
-    SharedMem *dest_mem;
-    SharedMem *src_mem;
-} ThreadArgs;
+	unsigned char *file_buf;
+	int chunk_size;
+	ChunkHash *chunks;
+	int start;
+	int end;
+	GlobalTable *gt;
+} HashInsertArgs;
 
 typedef struct {
 	ChunkHash *chunks;
-	SharedMem *final_mem;
+	GlobalTable *gt;
 	char *out_buf;
 	int start;
 	int end;
 	int hash_size;
 } ClassifyArgs;
 
-static void *classify_worker(void *arg) {
+/* Map a digest to a starting slot; table length is a power of two. */
+static int key_slot(const unsigned char *digest, int slots_len)
+{
+	uint64_t prefix;
+	memcpy(&prefix, digest, 8);
+	return (int)(prefix & (uint64_t)(slots_len - 1));
+}
+
+static int round_up_pow2(int x)
+{
+	if (x <= 1)
+		return 1;
+	unsigned u = (unsigned)x - 1u;
+	u |= u >> 1;
+	u |= u >> 2;
+	u |= u >> 4;
+	u |= u >> 8;
+	u |= u >> 16;
+	return (int)(u + 1u);
+}
+
+static void global_table_init(GlobalTable *t, int n_chunks)
+{
+	int need = HT_SLOT_FACTOR * n_chunks;
+	if (need < HT_MIN_SLOTS_LEN)
+		need = HT_MIN_SLOTS_LEN;
+	t->slots_len = round_up_pow2(need);
+	t->n_chunks = n_chunks;
+	atomic_init(&t->next_data, 0);
+
+	t->data = (ChunkHash *)calloc((size_t)n_chunks, sizeof(ChunkHash));
+	assert(t->data != NULL);
+	t->slots = (int *)malloc((size_t)t->slots_len * sizeof(int));
+	assert(t->slots != NULL);
+	for (int i = 0; i < t->slots_len; i++)
+		t->slots[i] = -1;
+
+	for (int s = 0; s < NUM_STRIPES; s++)
+		pthread_mutex_init(&t->stripes[s], NULL);
+}
+
+static void global_table_destroy(GlobalTable *t)
+{
+	for (int s = 0; s < NUM_STRIPES; s++)
+		pthread_mutex_destroy(&t->stripes[s]);
+	free(t->slots);
+	free(t->data);
+}
+
+static void striped_add_chunk(GlobalTable *t, const ChunkHash *chunk)
+{
+	const int hash_size = size_sha512();
+	int idx = key_slot(chunk->hash, t->slots_len);
+
+	for (;;) {
+		int stripe = idx % NUM_STRIPES;
+		pthread_mutex_lock(&t->stripes[stripe]);
+
+		int si = t->slots[idx];
+		if (si < 0) {
+			int di = atomic_fetch_add_explicit(&t->next_data, 1,
+							     memory_order_acq_rel);
+			assert(di < t->n_chunks);
+			t->data[di] = *chunk;
+			t->slots[idx] = di;
+			pthread_mutex_unlock(&t->stripes[stripe]);
+			return;
+		}
+		if (memcmp(t->data[si].hash, chunk->hash, (size_t)hash_size) ==
+		    0) {
+			if (t->data[si].index > chunk->index)
+				t->data[si].index = chunk->index;
+			pthread_mutex_unlock(&t->stripes[stripe]);
+			return;
+		}
+		pthread_mutex_unlock(&t->stripes[stripe]);
+		idx = (idx + 1) & (t->slots_len - 1);
+	}
+}
+
+static int lookup_canonical_index(GlobalTable *t, const unsigned char *hash,
+				  int hs)
+{
+	int idx = key_slot(hash, t->slots_len);
+	for (;;) {
+		int si = t->slots[idx];
+		assert(si >= 0);
+		if (memcmp(t->data[si].hash, hash, (size_t)hs) == 0)
+			return t->data[si].index;
+		idx = (idx + 1) & (t->slots_len - 1);
+	}
+}
+
+static void *hash_insert_worker(void *arg)
+{
+	HashInsertArgs *t = (HashInsertArgs *)arg;
+	const size_t cs = (size_t)t->chunk_size;
+
+	for (int i = t->start; i < t->end; i++) {
+		t->chunks[i].index = i;
+		t->chunks[i].hash = calculate_sha512(
+		    t->file_buf + (size_t)i * cs, t->chunk_size);
+		assert(t->chunks[i].hash != NULL);
+		striped_add_chunk(t->gt, &t->chunks[i]);
+	}
+	return NULL;
+}
+
+static void *classify_worker(void *arg)
+{
 	ClassifyArgs *t = (ClassifyArgs *)arg;
 	const int hs = t->hash_size;
 
 	for (int i = t->start; i < t->end; i++) {
-		int j = 0;
-		for (; j < t->final_mem->count; j++) {
-			if (t->final_mem->data[j].hash != NULL &&
-			    memcmp(t->final_mem->data[j].hash, t->chunks[i].hash,
-				   (size_t)hs) == 0) {
-				break;
-			}
-		}
-		assert(j < t->final_mem->count);
-		t->out_buf[i] =
-		    (t->final_mem->data[j].index == i) ? '0' : '1';
+		int canon = lookup_canonical_index(t->gt, t->chunks[i].hash,
+						   hs);
+		t->out_buf[i] = (canon == i) ? '0' : '1';
 	}
 	return NULL;
 }
 
-// Helper to initialize a SharedMem
-static SharedMem* create_mem(int cap) {
-    if (cap < 1) cap = 1;
-    SharedMem *m = (SharedMem *)malloc(sizeof(SharedMem));
-    assert(m != NULL);
-    m->data = (ChunkHash *)malloc(sizeof(ChunkHash) * (size_t)cap);
-    assert(m->data != NULL);
-    m->count = 0;
-    m->capacity = cap;
-    pthread_mutex_init(&m->lock, NULL);
-    return m;
-}
-
-// Helper to free a SharedMem and its contents
-static void destroy_mem(SharedMem *m) {
-    if (!m) return;
-    pthread_mutex_destroy(&m->lock);
-    free(m->data);
-    free(m);
-}
-
-// Helper to add a unique chunk to SharedMem
-static void add_chunk(SharedMem *shared, ChunkHash chunk) {
-	pthread_mutex_lock(&shared->lock);
-
-	bool found = false;
-	const int hash_size = size_sha512();
-	for (int i = 0; i < shared->count; i++) {
-		if (shared->data[i].hash != NULL && chunk.hash != NULL &&
-		    memcmp(shared->data[i].hash, chunk.hash, (size_t)hash_size) == 0) {
-			found = true;
-
-			if (shared->data[i].index > chunk.index) {
-				shared->data[i].index = chunk.index;
-			}
-			break;
-		}
-	}
-
-	if (!found) {
-		if (shared->count >= shared->capacity) {
-			shared->capacity *= 2;
-			ChunkHash *tmp = (ChunkHash *)realloc(shared->data,
-				(size_t)shared->capacity * sizeof(ChunkHash));
-			assert(tmp != NULL);
-			shared->data = tmp;
-		}
-		shared->data[shared->count++] = chunk;
-	}
-
-	pthread_mutex_unlock(&shared->lock);
-}
-
-
-// Worker function for threads 
-static void *worker(void *arg) {
-	ThreadArgs *t = (ThreadArgs *)arg;
-
-	if (t->input_array != NULL) {
-        for (int i = t->start; i < t->end; i++) {
-            add_chunk(t->dest_mem, t->input_array[i]);
-        }
-    } else if (t->src_mem != NULL) {
-        for (int i = 0; i < t->src_mem->count; i++) {
-            add_chunk(t->dest_mem, t->src_mem->data[i]);
-        }
-    }
-
-	return NULL;
-}
-
-// Function name: dedupe
-// Description:   Computes a hash for each chunk of the input file, and the obtained hashes
-//                to each other to determine the number of unique chunks in the file
-void dedupe(char *filename, int chunk_size, char *output) {
+void dedupe(char *filename, int chunk_size, char *output)
+{
 	FILE *fp;
-	char *buffer = (char *)malloc((size_t)chunk_size * sizeof(char));
-	assert(buffer != NULL);
 	int hash_size = size_sha512();
 
-	ChunkHash *chunks = NULL;
-	int n_chunks = 0;
-
-	// load chunks of the input file and hash them
 	fp = fopen(filename, "r");
 	assert(fp != NULL);
+	assert(fseek(fp, 0, SEEK_END) == 0);
+	long file_len = ftell(fp);
+	assert(file_len >= 0);
+	assert(fseek(fp, 0, SEEK_SET) == 0);
 
-	while (fread(buffer, sizeof(char), (size_t)chunk_size, fp) == (size_t)chunk_size) {
-		ChunkHash *tmp = (ChunkHash *)realloc(chunks, (size_t)(n_chunks + 1) * sizeof(ChunkHash));
-		assert(tmp != NULL);
-		chunks = tmp;
-
-		chunks[n_chunks].index = n_chunks;
-		chunks[n_chunks].hash = calculate_sha512((unsigned char *)buffer, chunk_size);
-		assert(chunks[n_chunks].hash != NULL);
-		n_chunks++;
+	int n_chunks = 0;
+	if (chunk_size > 0) {
+		n_chunks = (int)((unsigned long long)file_len /
+				 (unsigned long long)chunk_size);
 	}
-	fclose(fp);
 
-	// If the file is smaller than one chunk, match baseline: one newline only.
-	if (n_chunks == 0) {
+	if (n_chunks <= 0) {
+		fclose(fp);
 		fp = fopen(output, "wb");
 		assert(fp != NULL);
 		fputc('\n', fp);
 		fclose(fp);
-		free(buffer);
-		free(chunks);
 		return;
 	}
 
-	// Use up to MAX_PARALLEL_WORKERS threads, but never more than n_chunks, and avoid 0-sized ranges.
-	int n_threads0 = MAX_PARALLEL_WORKERS;
-	if (n_threads0 > n_chunks) n_threads0 = n_chunks;
-	if (n_threads0 < 1) n_threads0 = 1;
-	int n_mems0 = (n_threads0 + 1) / 2;
+	size_t payload = (size_t)n_chunks * (size_t)chunk_size;
+	unsigned char *file_buf =
+	    (unsigned char *)malloc(payload * sizeof(unsigned char));
+	assert(file_buf != NULL);
+	size_t got = fread(file_buf, 1, payload, fp);
+	fclose(fp);
+	assert(got == payload);
 
-	// Level 0: N threads into ceil(N/2) mems
-	SharedMem **lv0_mems = (SharedMem **)malloc((size_t)n_mems0 * sizeof(SharedMem *));
-	assert(lv0_mems != NULL);
-	for (int i = 0; i < n_mems0; i++) lv0_mems[i] = create_mem(INITIAL_CAPACITY);
+	ChunkHash *chunks =
+	    (ChunkHash *)malloc((size_t)n_chunks * sizeof(ChunkHash));
+	assert(chunks != NULL);
 
-	pthread_t *threads = (pthread_t *)malloc((size_t)n_threads0 * sizeof(pthread_t));
-	ThreadArgs *thread_args = (ThreadArgs *)calloc((size_t)n_threads0, sizeof(ThreadArgs));
-	assert(threads != NULL && thread_args != NULL);
+	GlobalTable *gt = (GlobalTable *)malloc(sizeof(GlobalTable));
+	assert(gt != NULL);
+	global_table_init(gt, n_chunks);
 
-	int per = (n_chunks + n_threads0 - 1) / n_threads0; // ceil
-	for (int i = 0; i < n_threads0; i++) {
-		int start = i * per;
-		int end = start + per;
-		if (end > n_chunks) end = n_chunks;
+	int n_workers = MAX_PARALLEL_WORKERS;
+	if (n_workers > n_chunks)
+		n_workers = n_chunks;
+	if (n_workers < 1)
+		n_workers = 1;
 
-		thread_args[i].input_array = chunks;
-		thread_args[i].start = start;
-		thread_args[i].end = end;
-		thread_args[i].dest_mem = lv0_mems[i / 2];
-		thread_args[i].src_mem = NULL;
-		pthread_create(&threads[i], NULL, worker, (void *)&thread_args[i]);
+	pthread_t *workers =
+	    (pthread_t *)malloc((size_t)n_workers * sizeof(pthread_t));
+	HashInsertArgs *work_args =
+	    (HashInsertArgs *)calloc((size_t)n_workers, sizeof(HashInsertArgs));
+	assert(workers != NULL && work_args != NULL);
+
+	int w_per = (n_chunks + n_workers - 1) / n_workers;
+	for (int i = 0; i < n_workers; i++) {
+		int w_start = i * w_per;
+		int w_end = w_start + w_per;
+		if (w_end > n_chunks)
+			w_end = n_chunks;
+		work_args[i].file_buf = file_buf;
+		work_args[i].chunk_size = chunk_size;
+		work_args[i].chunks = chunks;
+		work_args[i].start = w_start;
+		work_args[i].end = w_end;
+		work_args[i].gt = gt;
+		pthread_create(&workers[i], NULL, hash_insert_worker,
+			       (void *)&work_args[i]);
 	}
-	for (int i = 0; i < n_threads0; i++) pthread_join(threads[i], NULL);
+	for (int i = 0; i < n_workers; i++)
+		pthread_join(workers[i], NULL);
 
-	free(threads);
-	free(thread_args);
-
-	// Level 1: merge lv0 mems into 2 mems (or 1 if only one input mem)
-	int n_mems1 = (n_mems0 > 1) ? 2 : 1;
-	SharedMem *lv1_mems[2] = {0};
-	for (int i = 0; i < n_mems1; i++) lv1_mems[i] = create_mem(n_chunks);
-
-	pthread_t lv1_threads[4];
-	ThreadArgs lv1_thread_args[4] = {0};
-	for (int i = 0; i < n_mems0; i++) {
-		lv1_thread_args[i].input_array = NULL;
-		lv1_thread_args[i].src_mem = lv0_mems[i];
-		lv1_thread_args[i].dest_mem = lv1_mems[(n_mems1 == 1) ? 0 : (i / 2)];
-		pthread_create(&lv1_threads[i], NULL, worker, (void *)&lv1_thread_args[i]);
-	}
-	for (int i = 0; i < n_mems0; i++) pthread_join(lv1_threads[i], NULL);
-
-	for (int i = 0; i < n_mems0; i++) destroy_mem(lv0_mems[i]);
-	free(lv0_mems);
-
-	// Level 2: merge lv1 mems into final
-	SharedMem *final_mem = create_mem(n_chunks);
-	pthread_t lv2_threads[2];
-	ThreadArgs lv2_thread_args[2] = {0};
-	for (int i = 0; i < n_mems1; i++) {
-		lv2_thread_args[i].input_array = NULL;
-		lv2_thread_args[i].src_mem = lv1_mems[i];
-		lv2_thread_args[i].dest_mem = final_mem;
-		pthread_create(&lv2_threads[i], NULL, worker, (void *)&lv2_thread_args[i]);
-	}
-	for (int i = 0; i < n_mems1; i++) pthread_join(lv2_threads[i], NULL);
-
-	for (int i = 0; i < n_mems1; i++) destroy_mem(lv1_mems[i]);
+	free(workers);
+	free(work_args);
+	free(file_buf);
 
 	char *out_buf = (char *)malloc((size_t)n_chunks);
 	assert(out_buf != NULL);
 
 	int n_classify = MAX_PARALLEL_WORKERS;
-	if (n_classify > n_chunks) n_classify = n_chunks;
-	if (n_classify < 1) n_classify = 1;
+	if (n_classify > n_chunks)
+		n_classify = n_chunks;
+	if (n_classify < 1)
+		n_classify = 1;
 
 	pthread_t *classify_threads =
 	    (pthread_t *)malloc((size_t)n_classify * sizeof(pthread_t));
@@ -256,10 +263,11 @@ void dedupe(char *filename, int chunk_size, char *output) {
 	for (int i = 0; i < n_classify; i++) {
 		int c_start = i * c_per;
 		int c_end = c_start + c_per;
-		if (c_end > n_chunks) c_end = n_chunks;
+		if (c_end > n_chunks)
+			c_end = n_chunks;
 
 		classify_args[i].chunks = chunks;
-		classify_args[i].final_mem = final_mem;
+		classify_args[i].gt = gt;
 		classify_args[i].out_buf = out_buf;
 		classify_args[i].start = c_start;
 		classify_args[i].end = c_end;
@@ -277,7 +285,8 @@ void dedupe(char *filename, int chunk_size, char *output) {
 	assert(fp != NULL);
 	if ((size_t)n_chunks >= (size_t)BUFSIZ) {
 		size_t io_sz = (size_t)n_chunks;
-		if (io_sz > STDIO_OUTPUT_BUFSZ) io_sz = STDIO_OUTPUT_BUFSZ;
+		if (io_sz > STDIO_OUTPUT_BUFSZ)
+			io_sz = STDIO_OUTPUT_BUFSZ;
 		setvbuf(fp, NULL, _IOFBF, io_sz);
 	}
 	size_t written = fwrite(out_buf, 1, (size_t)n_chunks, fp);
@@ -286,10 +295,10 @@ void dedupe(char *filename, int chunk_size, char *output) {
 	fclose(fp);
 	free(out_buf);
 
-	// Cleanup
-	for (int i = 0; i < n_chunks; i++) free(chunks[i].hash);
+	for (int i = 0; i < n_chunks; i++)
+		free(chunks[i].hash);
 	free(chunks);
 
-	destroy_mem(final_mem);
+	global_table_destroy(gt);
+	free(gt);
 }
-
