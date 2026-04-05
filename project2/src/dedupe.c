@@ -8,6 +8,8 @@
 #include <stdbool.h>
 
 #define INITIAL_CAPACITY 1024
+#define MAX_PARALLEL_WORKERS 8
+#define STDIO_OUTPUT_BUFSZ ((size_t)1 << 20)
 
 // Chunk structure
 typedef struct {
@@ -32,6 +34,35 @@ typedef struct {
     SharedMem *dest_mem;
     SharedMem *src_mem;
 } ThreadArgs;
+
+typedef struct {
+	ChunkHash *chunks;
+	SharedMem *final_mem;
+	char *out_buf;
+	int start;
+	int end;
+	int hash_size;
+} ClassifyArgs;
+
+static void *classify_worker(void *arg) {
+	ClassifyArgs *t = (ClassifyArgs *)arg;
+	const int hs = t->hash_size;
+
+	for (int i = t->start; i < t->end; i++) {
+		int j = 0;
+		for (; j < t->final_mem->count; j++) {
+			if (t->final_mem->data[j].hash != NULL &&
+			    memcmp(t->final_mem->data[j].hash, t->chunks[i].hash,
+				   (size_t)hs) == 0) {
+				break;
+			}
+		}
+		assert(j < t->final_mem->count);
+		t->out_buf[i] =
+		    (t->final_mem->data[j].index == i) ? '0' : '1';
+	}
+	return NULL;
+}
 
 // Helper to initialize a SharedMem
 static SharedMem* create_mem(int cap) {
@@ -132,19 +163,19 @@ void dedupe(char *filename, int chunk_size, char *output) {
 	}
 	fclose(fp);
 
-	// If the file is smaller than one chunk, report 0 unique chunks.
+	// If the file is smaller than one chunk, match baseline: one newline only.
 	if (n_chunks == 0) {
-		fp = fopen(output, "w");
+		fp = fopen(output, "wb");
 		assert(fp != NULL);
-		fprintf(fp, "%d\n", 0);
+		fputc('\n', fp);
 		fclose(fp);
 		free(buffer);
 		free(chunks);
 		return;
 	}
 
-	// Use up to 8 threads, but never more than n_chunks, and avoid 0-sized ranges.
-	int n_threads0 = 8;
+	// Use up to MAX_PARALLEL_WORKERS threads, but never more than n_chunks, and avoid 0-sized ranges.
+	int n_threads0 = MAX_PARALLEL_WORKERS;
 	if (n_threads0 > n_chunks) n_threads0 = n_chunks;
 	if (n_threads0 < 1) n_threads0 = 1;
 	int n_mems0 = (n_threads0 + 1) / 2;
@@ -208,13 +239,52 @@ void dedupe(char *filename, int chunk_size, char *output) {
 
 	for (int i = 0; i < n_mems1; i++) destroy_mem(lv1_mems[i]);
 
+	char *out_buf = (char *)malloc((size_t)n_chunks);
+	assert(out_buf != NULL);
 
-	
-	// Write result: CHANGE THIS 
-	fp = fopen(output, "w");
+	int n_classify = MAX_PARALLEL_WORKERS;
+	if (n_classify > n_chunks) n_classify = n_chunks;
+	if (n_classify < 1) n_classify = 1;
+
+	pthread_t *classify_threads =
+	    (pthread_t *)malloc((size_t)n_classify * sizeof(pthread_t));
+	ClassifyArgs *classify_args = (ClassifyArgs *)calloc(
+	    (size_t)n_classify, sizeof(ClassifyArgs));
+	assert(classify_threads != NULL && classify_args != NULL);
+
+	int c_per = (n_chunks + n_classify - 1) / n_classify;
+	for (int i = 0; i < n_classify; i++) {
+		int c_start = i * c_per;
+		int c_end = c_start + c_per;
+		if (c_end > n_chunks) c_end = n_chunks;
+
+		classify_args[i].chunks = chunks;
+		classify_args[i].final_mem = final_mem;
+		classify_args[i].out_buf = out_buf;
+		classify_args[i].start = c_start;
+		classify_args[i].end = c_end;
+		classify_args[i].hash_size = hash_size;
+		pthread_create(&classify_threads[i], NULL, classify_worker,
+			       (void *)&classify_args[i]);
+	}
+	for (int i = 0; i < n_classify; i++)
+		pthread_join(classify_threads[i], NULL);
+
+	free(classify_threads);
+	free(classify_args);
+
+	fp = fopen(output, "wb");
 	assert(fp != NULL);
-	fprintf(fp, "%d\n", final_mem->count);
+	if ((size_t)n_chunks >= (size_t)BUFSIZ) {
+		size_t io_sz = (size_t)n_chunks;
+		if (io_sz > STDIO_OUTPUT_BUFSZ) io_sz = STDIO_OUTPUT_BUFSZ;
+		setvbuf(fp, NULL, _IOFBF, io_sz);
+	}
+	size_t written = fwrite(out_buf, 1, (size_t)n_chunks, fp);
+	assert(written == (size_t)n_chunks);
+	fputc('\n', fp);
 	fclose(fp);
+	free(out_buf);
 
 	// Cleanup
 	for (int i = 0; i < n_chunks; i++) free(chunks[i].hash);
