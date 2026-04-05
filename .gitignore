@@ -1,5 +1,5 @@
 project2
-out1.txt
-out2.txt
-gentest.py
-genconfig.py
+out/
+out_ref/
+ref_running_time.txt
+relative_running_time.txt
